@@ -179,48 +179,57 @@ def tree_find_item_arrays(obj: Any, depth: int = 0) -> List[List[Dict[str, Any]]
     return results
 
 
-def parse_item_row(it: Dict[str, Any]) -> Dict[str, Any]:
-    # description
-    desc = clean_text(
-        it.get("name") or it.get("title") or it.get("description") or it.get("desc")
-    )
+def parse_item_row(it: Dict[str, Any], cat_lookup: dict) -> Dict[str, Any]:
+    # Description
+    desc = clean_text(it.get("name") or it.get("title") or it.get("description") or it.get("desc"))
 
-    # category/department
+    # Category via direct string or via referenced IDs
     cat = (
-        clean_text(it.get("category"))
-        or clean_text(it.get("department"))
-        or clean_text(it.get("dept"))
-        or clean_text(
-            (it.get("hierarchy") or {}).get("department")
-            if isinstance(it.get("hierarchy"), dict) else None
-        )
+        clean_text(it.get("category") or it.get("department") or it.get("dept")) or
+        None
+    )
+    if not cat:
+        ids = []
+        for k in ("category_ids", "categories", "department_ids", "section_ids"):
+            v = it.get(k)
+            if isinstance(v, list):
+                ids.extend(v)
+            elif v is not None:
+                ids.append(v)
+        # First match wins
+        for _id in ids:
+            name = cat_lookup.get(str(_id))
+            if name:
+                cat = name
+                break
+
+    # Prices
+    sale = to_float(it.get("sale_price") or it.get("current_price") or it.get("promo_price"))
+    orig = to_float(it.get("regular_price") or it.get("compare_at_price") or it.get("original_price"))
+
+    price = it.get("price") or it.get("prices") or it.get("pricing") or {}
+    if isinstance(price, dict):
+        sale = sale or to_float(price.get("sale") or price.get("current") or price.get("promo") or price.get("display"))
+        orig = orig or to_float(price.get("regular") or price.get("was") or price.get("compare_at") or price.get("strikethrough") or price.get("compare_at_display"))
+
+    # Deal/marketing text (helps infer BO(G)O etc.)
+    deal_text = clean_text(
+        it.get("offer_text") or it.get("badge_text") or it.get("tagline") or
+        it.get("promotion_text") or it.get("promo_text") or it.get("deal_text")
     )
 
-    # Price resolution (many schemas possible)
-    sale = None
-    orig = None
-
-    # common top-level fields
-    sale = sale or to_float(it.get("sale_price") or it.get("current_price") or it.get("promo_price"))
-    orig = orig or to_float(it.get("regular_price") or it.get("compare_at_price") or it.get("original_price"))
-
-    # nested price objects
-    price = it.get("price") or it.get("prices") or it.get("pricing")
-    if isinstance(price, dict):
-        sale = sale or to_float(price.get("sale") or price.get("current") or price.get("promo"))
-        orig = orig or to_float(price.get("regular") or price.get("was") or price.get("compare_at"))
-
-        # Sometimes multi-buy shown as strings inside pricing
-        if sale is None:
-            sale = to_float(price.get("display"))  # e.g. "2/$5"
-        if orig is None:
-            orig = to_float(price.get("strikethrough") or price.get("compare_at_display"))
-
-    # fallback: parse any obvious strings
+    # Heuristics: infer unit price from common patterns if sale missing
     if sale is None:
-        sale = to_float(it.get("price_text") or it.get("sale_text") or it.get("offer_text"))
-    if orig is None:
-        orig = to_float(it.get("regular_text") or it.get("was_text"))
+        sale = to_float(deal_text)  # catches "2/$5" etc.
+    # Basic BOGO heuristics (only if we have an original price)
+    if sale is None and orig and deal_text:
+        s = deal_text.lower()
+        # BOGO (Buy 1 Get 1 Free) ≈ 50% off per unit
+        if "bogo" in s or ("buy 1" in s and "get 1" in s and "free" in s):
+            sale = round(orig / 2.0, 2)
+        # Buy 2 get 1 free → effective 2/3 of orig per unit
+        elif ("buy 2" in s and "get 1" in s and "free" in s):
+            sale = round(orig * (2.0/3.0), 2)
 
     return {
         "Description": desc,
@@ -228,6 +237,8 @@ def parse_item_row(it: Dict[str, Any]) -> Dict[str, Any]:
         "Original Price": orig,
         "Sale Price": sale,
         "% Discount": pct_off(orig, sale),
+        # Optional: keep the raw marketing text for transparency
+        "Deal Text": deal_text,
     }
 
 
@@ -307,24 +318,70 @@ async def discover_weekly_json(page) -> Tuple[Optional[dict], Optional[str]]:
 
 
 def parse_rows_from_payload(payload: dict) -> List[Dict[str, Any]]:
-    """
-    From the discovered JSON, pull out the best 'items' list(s) and convert to rows.
-    """
     rows: List[Dict[str, Any]] = []
-    item_sets = tree_find_item_arrays(payload)
+    cat_lookup = build_category_lookup(payload)
 
-    # choose the largest item set
-    items: List[Dict[str, Any]] = []
-    if item_sets:
-        items = max(item_sets, key=lambda arr: len(arr))
+    item_sets = tree_find_item_arrays(payload)
+    items: List[Dict[str, Any]] = max(item_sets, key=lambda arr: len(arr)) if item_sets else []
 
     for it in items:
         if not isinstance(it, dict):
             continue
-        row = parse_item_row(it)
-        if row.get("Description") and row.get("Sale Price") is not None:
+        row = parse_item_row(it, cat_lookup)
+        # Keep rows that at least have a description and some price info
+        if row.get("Description") and (row.get("Sale Price") is not None or row.get("Original Price") is not None):
             rows.append(row)
     return rows
+
+
+def build_category_lookup(payload: dict) -> dict:
+    """
+    Returns a mapping of {id -> category/department name} by scanning common
+    places the circular schema uses to define categories/sections/departments.
+    """
+    lookup = {}
+
+    def add_from(obj, id_key="id", name_key="name"):
+        if isinstance(obj, dict):
+            # dict-of-dicts or dict-of-lists
+            for v in obj.values():
+                add_from(v, id_key, name_key)
+        elif isinstance(obj, list):
+            for x in obj:
+                add_from(x, id_key, name_key)
+        elif isinstance(obj, (str, int, float)):
+            return
+
+        if isinstance(obj, dict) and id_key in obj and name_key in obj:
+            try:
+                lookup[str(obj[id_key])] = str(obj[name_key]).strip()
+            except Exception:
+                pass
+
+    # Common containers seen in circular payloads
+    for key in ["categories", "departments", "sections", "taxonomy", "nodes"]:
+        if key in payload:
+            add_from(payload[key])
+    # Some schemas tuck them under data/meta
+    for key in ["data", "meta"]:
+        if key in payload:
+            for sub in ["categories", "departments", "sections", "taxonomy", "nodes"]:
+                if isinstance(payload[key], dict) and sub in payload[key]:
+                    add_from(payload[key][sub])
+
+    return lookup
+
+def flyer_dates(payload: dict) -> tuple[Optional[str], Optional[str]]:
+    # Try common places for start/end
+    for k in ["flyer", "data", "meta"]:
+        obj = payload.get(k, {})
+        if not isinstance(obj, dict): 
+            continue
+        start = clean_text(obj.get("start_date") or obj.get("start") or obj.get("effective_date"))
+        end   = clean_text(obj.get("end_date")   or obj.get("end")   or obj.get("expiration_date"))
+        if start or end:
+            return start, end
+    return None, None
 
 
 # -----------------------
@@ -408,8 +465,13 @@ async def run() -> int:
             await browser.close()
             return 3
 
-        await browser.close()
+        start, end = flyer_dates(payload)
+        if start or end:
+            print(f"[INFO] Flyer dates: {start} → {end}")
 
+        await browser.close()
+        
+    
     # Parse → DataFrame
     rows = parse_rows_from_payload(payload)
     df = pd.DataFrame(rows).drop_duplicates().copy()
@@ -443,4 +505,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
