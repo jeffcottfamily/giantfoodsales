@@ -44,13 +44,34 @@ jobs:
             python -m playwright install --with-deps chromium
 
       # Materialize the Google service account JSON from a GitHub Secret
-      - name: Write service account key
+      - name: Write service account key from base64
         run: |
-          echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}' > "${GOOGLE_APPLICATION_CREDENTIALS}"
+          echo "${{ secrets.GOOGLE_SERVICE_ACCOUNT_B64 }}" | base64 -d > "$GOOGLE_APPLICATION_CREDENTIALS"
+          python - <<'PY'
+import json,os,sys
+p=os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
+try:
+    with open(p) as f: json.load(f)
+    print("[INFO] service_account.json looks valid.")
+except Exception as e:
+    print("[ERROR] service_account.json invalid:", e); sys.exit(1)
+PY
 
-      - name: Run scraper
+      - name: Run scraper (unbuffered)
         run: |
-          python giant_specials_to_sheets.py
+          python -u giant_specials_to_sheets.py
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-debug
+          path: |
+            *.csv
+            *.xlsx
+            page.png
+            page.html
+          if-no-files-found: ignore
 
       # Optional: upload CSV/XLSX the script generated as run artifacts
       - name: Upload data artifacts
