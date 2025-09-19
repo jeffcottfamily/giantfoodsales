@@ -1,14 +1,18 @@
 # giant_specials_to_sheets.py
-# Scrape Giant Food "All Specials" for a specific store and write to Google Sheets.
-# Includes robust diagnostics for GitHub Actions: selector counts, service account info,
-# and screenshot/HTML artifacts if zero rows are scraped.
+# Weekly Ad → Google Sheets (store 2333, Fort Ave Baltimore)
+# Strategy:
+#   1) Open the Giant circular page for the store on circular.giantfood.com
+#   2) Passively capture JSON responses the page requests (no DOM scraping)
+#   3) Pick the response that actually contains item data and parse it
+#   4) Write Description, Category, Original Price, Sale Price, % Discount to Google Sheets
+#   5) On failure, save weekly_ad.json + page.png/page.html and exit non-zero (for GitHub Actions)
 
 import asyncio
 import json
 import os
 import re
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import gspread
@@ -19,53 +23,69 @@ from playwright.async_api import async_playwright
 # Config
 # -----------------------
 
-ALL_SPECIALS_URL = "https://giantfood.com/savings/all-specials"
-STORE_PAGE_URL = "https://stores.giantfood.com/md/baltimore-city/857-east-fort-avenue"
-TARGET_STORE_NUM = "2333"  # 857 E Fort Ave (Baltimore) store number
+STORE_CODE = "2333"  # 857 E Fort Ave (Baltimore)
+CIRCULAR_URL = (
+    f"https://circular.giantfood.com/flyers/giantfood-weekly"
+    f"?locale=en-US&store_code={STORE_CODE}&type=1"
+)
 
-# Use the full Google Sheet URL (recommended to avoid ghost sheets owned by the service account)
-GOOGLE_SHEET_URL_OR_NAME = "https://docs.google.com/spreadsheets/d/1LbfYLSx2Pj_V5B_1qg4gSdcRB_k1slVrMN2LMdwTpaw/edit"
-WORKSHEET_NAME = f"All Specials - Store {TARGET_STORE_NUM}"
+# Use the full Google Sheet URL (recommended)
+GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1LbfYLSx2Pj_V5B_1qg4gSdcRB_k1slVrMN2LMdwTpaw/edit"
+WORKSHEET_NAME = f"Weekly Ad - Store {STORE_CODE}"
 
-# Path to service account JSON is provided by env var in GitHub Actions workflow
+# Path to service account JSON (provided by env in GitHub Actions)
 SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "service_account.json")
 
-# Enable extra logging + capture page.png/page.html if no rows are scraped
+# Diagnostics/artifacts
 DEBUG = True
+ARTIFACT_JSON = "weekly_ad.json"
+ARTIFACT_PAGE_PNG = "page.png"
+ARTIFACT_PAGE_HTML = "page.html"
 
 
 # -----------------------
-# Helpers
+# Utilities
 # -----------------------
 
 def clean_text(s: Optional[str]) -> Optional[str]:
-    if not s:
+    if s is None:
         return None
-    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\s+", " ", str(s)).strip()
     return s or None
 
 
-def money_to_float(s: Optional[str]) -> Optional[float]:
+def to_float(v: Any) -> Optional[float]:
     """
-    Converts price-like strings to a per-unit float.
-    Handles: "$2.99", "2/$5", "$3.99/lb", "$1.50 ea", etc.
-    For "2/$5" returns 2.50; for "$3.99/lb" returns 3.99.
+    Convert various numeric/price forms to float.
+    Handles:
+      - 2/$5  (returns 2.50)
+      - "$3.99", "3.99", "$3.99/lb", "3,499.00"
+      - numeric types
     """
-    if not s:
+    if v is None:
         return None
-    s = s.strip()
+    if isinstance(v, (int, float)):
+        return float(v)
 
-    # "2/$5" style
+    s = str(v)
+    s = s.replace(",", "").strip()
+
+    # Multi-buy like "2/$5"
     m = re.search(r"(\d+)\s*/\s*\$?(\d+(?:\.\d+)?)", s)
     if m:
         qty = float(m.group(1))
         total = float(m.group(2))
-        if qty:
+        if qty > 0:
             return round(total / qty, 2)
 
-    # "$2.99", "2.99", "$3.99/lb"
+    # $x.xx or bare number (allow trailing unit text like /lb)
     m = re.search(r"\$?(\d+(?:\.\d+)?)", s)
-    return float(m.group(1)) if m else None
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
+    return None
 
 
 def pct_off(orig: Optional[float], sale: Optional[float]) -> Optional[float]:
@@ -74,67 +94,15 @@ def pct_off(orig: Optional[float], sale: Optional[float]) -> Optional[float]:
     return None
 
 
-async def text_or_none(locator) -> Optional[str]:
-    """Safely get text_content() from a Locator (first match); return None if not found."""
-    try:
-        return clean_text(await locator.first.text_content(timeout=1000))
-    except Exception:
-        return None
-
-
-async def all_texts(locator) -> List[str]:
-    """Safely get all_text_contents() from a Locator; returns [] if not found."""
-    try:
-        contents = await locator.all_text_contents()
-        return [t for t in (clean_text(x) for x in contents) if t]
-    except Exception:
-        return []
-
-
 # -----------------------
-# Store / Cookie Context
+# Playwright helpers
 # -----------------------
 
-async def set_store_cookie(context):
-    """
-    Establish store context by visiting the official store page and clicking through,
-    then add commonly used store cookies as a fallback.
-    """
+async def open_circular_page(context):
     page = await context.new_page()
-    try:
-        await page.goto(STORE_PAGE_URL, wait_until="domcontentloaded")
-        # Try "Order Groceries Online" / "Shop this store" style links (sets store context)
-        links = page.locator(
-            "a:has-text('Order Groceries Online'), a:has-text('Shop'), a[href*='giantfood.com']"
-        )
-        if await links.count() > 0:
-            try:
-                await links.nth(0).click()
-                await page.wait_for_load_state("domcontentloaded")
-            except Exception:
-                pass
-    except Exception:
-        pass
+    await page.goto(CIRCULAR_URL)
 
-    # Fallback cookies (harmless if ignored by site)
-    try:
-        await context.add_cookies([
-            {"name": "preferred_store", "value": TARGET_STORE_NUM, "domain": ".giantfood.com", "path": "/"},
-            {"name": "storeId", "value": TARGET_STORE_NUM, "domain": ".giantfood.com", "path": "/"},
-        ])
-    except Exception:
-        pass
-    await page.close()
-
-
-async def open_all_specials_page(context):
-    """
-    Open the All Specials page and accept common cookie banners if present.
-    """
-    page = await context.new_page()
-    await page.goto(ALL_SPECIALS_URL)
-
-    # Accept cookies (OneTrust + fallback labels)
+    # Cookie banner (OneTrust variants)
     try:
         await page.locator(
             "#onetrust-accept-btn-handler, button:has-text('Accept All'), button:has-text('Accept all')"
@@ -142,158 +110,211 @@ async def open_all_specials_page(context):
     except Exception:
         pass
 
-    await page.wait_for_load_state("networkidle")
+    await page.wait_for_load_state("domcontentloaded")
     return page
 
 
+async def is_botwall(page) -> bool:
+    """Detect obvious CAPTCHA/bot-wall pages early."""
+    try:
+        html = await page.content()
+        if "captcha-delivery.com" in html.lower():
+            return True
+        if await page.locator("text=Verification Required").count() > 0:
+            return True
+        if await page.locator("iframe[src*='captcha']").count() > 0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 # -----------------------
-# Scraper
+# JSON discovery and parsing
 # -----------------------
 
-async def scrape_all_specials() -> List[Dict]:
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-            ),
-            timezone_id="America/New_York",
-            locale="en-US",
-            viewport={"width": 1366, "height": 900},
-        )
+INTERESTING_URL_HINTS = (
+    "flyer", "item", "items", "product", "offers", "deals", "json", "api", "graphql"
+)
 
-        # Set store context and open the specials page
-        await set_store_cookie(context)
-        page = await open_all_specials_page(context)
+def looks_interesting(url: str, content_type: str) -> bool:
+    if "application/json" in (content_type or "").lower():
+        return True
+    u = url.lower()
+    return any(h in u for h in INTERESTING_URL_HINTS)
 
-        # Infinite scroll / lazy load: scroll until page height stabilizes twice
-        last_h, stable = 0, 0
-        while True:
-            try:
-                h = await page.evaluate("document.body.scrollHeight")
-            except Exception:
-                h = last_h
-            stable = stable + 1 if h == last_h else 0
-            last_h = h
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(900)
-            if stable >= 2:
-                break
 
-        # Probe likely product card selectors and log counts
-        sel_candidates = [
-            "[data-testid*='product']",
-            "article:has([class*='price'])",
-            "div[class*='card']:has([class*='price'])",
-            "li:has([class*='price'])",
-        ]
-        count_map = {}
-        for sel in sel_candidates:
-            try:
-                count_map[sel] = await page.locator(sel).count()
-            except Exception:
-                count_map[sel] = -1
-        print("[INFO] Candidate card counts:", count_map)
-
-        # Choose the first selector that yields a sensible number of cards
-        cards = None
-        for sel in sel_candidates:
-            loc = page.locator(sel)
-            try:
-                cnt = await loc.count()
-                if cnt >= 10:  # expect many specials; adjust if needed
-                    cards = loc
-                    break
-            except Exception:
-                continue
-        if cards is None:
-            # Fall back to a broad net (may include non-product nodes)
-            cards = page.locator("section, article, li, div")
-
-        results: List[Dict] = []
-        try:
-            n = await cards.count()
-        except Exception:
-            n = 0
-
-        for i in range(n):
-            el = cards.nth(i)
-
-            # Title/Description
-            title = await text_or_none(
-                el.locator("h3, h2, [class*='title'], [data-testid*='title'], [class*='name']")
-            )
-            # Price blobs
-            sale_text = await text_or_none(
-                el.locator("[class*='sale'], [data-testid*='sale'], [data-test*='sale'], [class*='price']")
-            )
-            orig_text = await text_or_none(
-                el.locator("[class*='was'], [class*='strikethrough'], [data-testid*='was']")
-            )
-
-            # If we only captured one price blob, attempt to parse "Was $X ... $Y"
-            if sale_text and not orig_text and "was" in sale_text.lower():
-                m1 = re.search(r"was[^$\d]*\$?(\d+(?:\.\d+)?)", sale_text, re.I)
-                if m1:
-                    # include the matching token as orig_text
-                    orig_text = m1.group(0)
-
-            sale_val = money_to_float(sale_text or "")
-            orig_val = money_to_float(orig_text or "")
-
-            # Sometimes the "price" class is the regular price. If so, swap.
-            if orig_val and sale_val and sale_val > orig_val:
-                sale_val, orig_val = orig_val, sale_val
-
-            # Filter out non-cards / incomplete data
-            if not title or sale_val is None:
-                continue
-
-            # Category heuristics: badges, chips, category links, aria labels
-            cat_candidates: List[str] = []
-            for sel in [
-                "[data-testid*='tag']",
-                "[class*='badge']",
-                "[class*='chip']",
-                "[class*='category']",
-                "a[href*='/categories/']",
-                "a[aria-label*='category']",
-            ]:
-                cat_candidates.extend(await all_texts(el.locator(sel)))
-
-            # remove price-like tokens; prefer shortest remaining label
-            category = None
-            if cat_candidates:
-                non_price = [
-                    c for c in cat_candidates
-                    if not re.search(r"\$|\d/\$|\d+\s*for\s*\d", c, re.I)
-                ]
-                chosen = non_price or cat_candidates
-                # avoid very long marketing blurbs; choose the shortest token
-                category = sorted(chosen, key=len)[0] if chosen else None
-
-            results.append({
-                "Description": title,
-                "Category": category,
-                "Original Price": orig_val,
-                "Sale Price": sale_val,
-                "% Discount": pct_off(orig_val, sale_val),
-            })
-
-        # If nothing scraped, capture artifacts to help debug
-        if DEBUG and len(results) == 0:
-            try:
-                await page.screenshot(path="page.png", full_page=True)
-                html = await page.content()
-                with open("page.html", "w", encoding="utf-8") as f:
-                    f.write(html)
-                print("[ERROR] Zero rows scraped; saved page.png/page.html for inspection.")
-            except Exception as e:
-                print("[WARN] Could not save debug artifacts:", e)
-
-        await browser.close()
+def tree_find_item_arrays(obj: Any, depth: int = 0) -> List[List[Dict[str, Any]]]:
+    """
+    Recursively search for arrays of dicts that look like item objects.
+    Heuristics: list of dicts with at least one of these keys per element:
+      name/title/description AND some price-ish key.
+    """
+    results: List[List[Dict[str, Any]]] = []
+    if depth > 6:
         return results
+
+    if isinstance(obj, list) and obj and all(isinstance(x, dict) for x in obj):
+        # Check if this list looks like item objects
+        price_keys = {"price", "prices", "sale_price", "current_price", "regular_price", "compare_at_price"}
+        name_keys = {"name", "title", "description", "desc"}
+        matches = 0
+        sample = obj[:8]
+        for it in sample:
+            keys = set(k.lower() for k in it.keys())
+            if keys & name_keys:
+                # price present either as direct keys or nested 'price' object
+                if (keys & price_keys) or ("price" in keys) or ("pricing" in keys):
+                    matches += 1
+        if matches >= max(2, len(sample) // 2):
+            results.append(obj)  # looks like items
+            return results
+
+    if isinstance(obj, dict):
+        for v in obj.values():
+            results.extend(tree_find_item_arrays(v, depth + 1))
+    elif isinstance(obj, list):
+        for v in obj:
+            results.extend(tree_find_item_arrays(v, depth + 1))
+    return results
+
+
+def parse_item_row(it: Dict[str, Any]) -> Dict[str, Any]:
+    # description
+    desc = clean_text(
+        it.get("name") or it.get("title") or it.get("description") or it.get("desc")
+    )
+
+    # category/department
+    cat = (
+        clean_text(it.get("category"))
+        or clean_text(it.get("department"))
+        or clean_text(it.get("dept"))
+        or clean_text(
+            (it.get("hierarchy") or {}).get("department")
+            if isinstance(it.get("hierarchy"), dict) else None
+        )
+    )
+
+    # Price resolution (many schemas possible)
+    sale = None
+    orig = None
+
+    # common top-level fields
+    sale = sale or to_float(it.get("sale_price") or it.get("current_price") or it.get("promo_price"))
+    orig = orig or to_float(it.get("regular_price") or it.get("compare_at_price") or it.get("original_price"))
+
+    # nested price objects
+    price = it.get("price") or it.get("prices") or it.get("pricing")
+    if isinstance(price, dict):
+        sale = sale or to_float(price.get("sale") or price.get("current") or price.get("promo"))
+        orig = orig or to_float(price.get("regular") or price.get("was") or price.get("compare_at"))
+
+        # Sometimes multi-buy shown as strings inside pricing
+        if sale is None:
+            sale = to_float(price.get("display"))  # e.g. "2/$5"
+        if orig is None:
+            orig = to_float(price.get("strikethrough") or price.get("compare_at_display"))
+
+    # fallback: parse any obvious strings
+    if sale is None:
+        sale = to_float(it.get("price_text") or it.get("sale_text") or it.get("offer_text"))
+    if orig is None:
+        orig = to_float(it.get("regular_text") or it.get("was_text"))
+
+    return {
+        "Description": desc,
+        "Category": cat,
+        "Original Price": orig,
+        "Sale Price": sale,
+        "% Discount": pct_off(orig, sale),
+    }
+
+
+async def discover_weekly_json(page) -> Tuple[Optional[dict], Optional[str]]:
+    """
+    Listen for JSON responses while the circular page loads.
+    Return (parsed_json, url) for the best candidate, saving to weekly_ad.json
+    """
+    captured: List[Tuple[str, int, str, bytes]] = []  # (url, size, ctype, body)
+
+    def score_candidate(url: str, size: int, ctype: str, obj: Any) -> int:
+        # Higher is better: prefer JSON with item arrays
+        base = 0
+        if looks_interesting(url, ctype):
+            base += 5
+        base += min(size // 2048, 20)  # size heuristic (2KB units capped)
+        item_sets = tree_find_item_arrays(obj)
+        base += 10 * len(item_sets)
+        if item_sets and len(item_sets[0]) >= 10:
+            base += 10
+        return base
+
+    @page.on("response")
+    async def handle_response(resp):
+        try:
+            url = resp.url
+            ctype = resp.headers.get("content-type", "")
+            if not looks_interesting(url, ctype):
+                return
+            body = await resp.body()
+            # Try decode JSON
+            try:
+                text = body.decode("utf-8", errors="ignore")
+                obj = json.loads(text)
+            except Exception:
+                return
+            captured.append((url, len(text), ctype, body))
+        except Exception:
+            pass
+
+    # Navigate + allow XHRs to complete
+    await page.route("**/*", lambda route: route.continue_())
+    await page.goto(CIRCULAR_URL, wait_until="domcontentloaded")
+    await page.wait_for_timeout(8000)  # give late requests time
+
+    # Rank candidates
+    best: Tuple[int, Optional[dict], Optional[str]] = (0, None, None)
+    for url, size, ctype, body in captured:
+        try:
+            text = body.decode("utf-8", errors="ignore")
+            obj = json.loads(text)
+            sc = score_candidate(url, size, ctype, obj)
+            if sc > best[0]:
+                best = (sc, obj, url)
+        except Exception:
+            continue
+
+    obj, url = best[1], best[2]
+    if obj:
+        # Save artifact
+        try:
+            with open(ARTIFACT_JSON, "w", encoding="utf-8") as f:
+                json.dump(obj, f, ensure_ascii=False)
+        except Exception:
+            pass
+    return obj, url
+
+
+def parse_rows_from_payload(payload: dict) -> List[Dict[str, Any]]:
+    """
+    From the discovered JSON, pull out the best 'items' list(s) and convert to rows.
+    """
+    rows: List[Dict[str, Any]] = []
+    item_sets = tree_find_item_arrays(payload)
+
+    # choose the largest item set
+    items: List[Dict[str, Any]] = []
+    if item_sets:
+        items = max(item_sets, key=lambda arr: len(arr))
+
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        row = parse_item_row(it)
+        if row.get("Description") and row.get("Sale Price") is not None:
+            rows.append(row)
+    return rows
 
 
 # -----------------------
@@ -304,7 +325,7 @@ def write_to_google_sheet(df: pd.DataFrame):
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_JSON, scopes=scopes)
 
-    # Log which service account we're using (helps catch wrong project/secret)
+    # Helpful log (which SA is writing)
     try:
         with open(SERVICE_ACCOUNT_JSON, "r") as f:
             svc = json.load(f)
@@ -313,14 +334,10 @@ def write_to_google_sheet(df: pd.DataFrame):
         print("[WARN] Could not read service account email:", e)
 
     gc = gspread.authorize(creds)
-    if GOOGLE_SHEET_URL_OR_NAME.startswith("http"):
-        sh = gc.open_by_url(GOOGLE_SHEET_URL_OR_NAME)
-        print("[INFO] Opened sheet by URL:", GOOGLE_SHEET_URL_OR_NAME)
-    else:
-        sh = gc.open(GOOGLE_SHEET_URL_OR_NAME)
-        print("[INFO] Opened sheet by NAME:", GOOGLE_SHEET_URL_OR_NAME)
+    sh = gc.open_by_url(GOOGLE_SHEET_URL)
+    print("[INFO] Opened sheet by URL:", GOOGLE_SHEET_URL)
 
-    # Delete/recreate target worksheet
+    # Replace target worksheet
     try:
         ws = sh.worksheet(WORKSHEET_NAME)
         sh.del_worksheet(ws)
@@ -338,36 +355,80 @@ def write_to_google_sheet(df: pd.DataFrame):
 # Main
 # -----------------------
 
-def main():
-    rows = asyncio.run(scrape_all_specials())
+async def run() -> int:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+            ),
+            timezone_id="America/New_York",
+            locale="en-US",
+            viewport={"width": 1366, "height": 900},
+        )
 
-    # Build DataFrame
+        page = await open_circular_page(context)
+
+        if await is_botwall(page):
+            # Save artifacts for inspection
+            try:
+                await page.screenshot(path=ARTIFACT_PAGE_PNG, full_page=True)
+                with open(ARTIFACT_PAGE_HTML, "w", encoding="utf-8") as f:
+                    f.write(await page.content())
+            except Exception:
+                pass
+            print("[ERROR] Blocked by bot protection (CAPTCHA) on circular site.")
+            await browser.close()
+            return 2
+
+        payload, src_url = await discover_weekly_json(page)
+        if payload:
+            print("[INFO] Weekly JSON discovered from:", src_url)
+        else:
+            # Capture page artifacts for debugging
+            if DEBUG:
+                try:
+                    await page.screenshot(path=ARTIFACT_PAGE_PNG, full_page=True)
+                    with open(ARTIFACT_PAGE_HTML, "w", encoding="utf-8") as f:
+                        f.write(await page.content())
+                except Exception:
+                    pass
+            print("[ERROR] Could not discover weekly ad JSON from the circular page.")
+            await browser.close()
+            return 3
+
+        await browser.close()
+
+    # Parse → DataFrame
+    rows = parse_rows_from_payload(payload)
     df = pd.DataFrame(rows).drop_duplicates().copy()
 
-    # Sort for readability
-    if "% Discount" in df.columns:
+    if not df.empty and "% Discount" in df.columns:
         df["% Discount"] = pd.to_numeric(df["% Discount"], errors="coerce")
         df = df.sort_values(by=["% Discount", "Description"], ascending=[False, True])
 
-    # Log a preview
-    try:
-        preview = df.head(3).to_dict(orient="records")
-    except Exception:
-        preview = []
-    print(f"[INFO] Scraped {len(df)} rows; first few:", preview)
-
-    # Save local backups (handy as GitHub Action artifacts)
+    # Local artifacts (handy to inspect in Actions)
     stamp = datetime.now().strftime("%Y%m%d")
-    if len(df) > 0:
-        df.to_csv(f"giant_all_specials_{TARGET_STORE_NUM}_{stamp}.csv", index=False)
-        df.to_excel(f"giant_all_specials_{TARGET_STORE_NUM}_{stamp}.xlsx", index=False)
+    if not df.empty:
+        df.to_csv(f"weekly_ad_parsed_{STORE_CODE}_{stamp}.csv", index=False)
+        df.to_excel(f"weekly_ad_parsed_{STORE_CODE}_{stamp}.xlsx", index=False)
 
-    # Fail loudly on zero rows so Actions surfaces the problem
-    if len(df) == 0:
-        raise SystemExit("0 rows scraped. See logs and artifacts (page.png/page.html).")
+    print(f"[INFO] Parsed rows: {len(df)}; preview:", df.head(3).to_dict(orient="records"))
+
+    if df.empty:
+        print("[ERROR] Zero rows parsed from the weekly ad JSON. See", ARTIFACT_JSON, "and page artifacts.")
+        return 4
 
     # Push to Google Sheets
     write_to_google_sheet(df)
+    return 0
+
+
+def main():
+    code = asyncio.run(run())
+    if code != 0:
+        raise SystemExit(code)
 
 
 if __name__ == "__main__":
