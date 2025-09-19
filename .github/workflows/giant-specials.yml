@@ -43,13 +43,17 @@ jobs:
         run: |
           python -m playwright install --with-deps chromium
 
-      # Materialize the Google service account key from base64 (no heredoc = no YAML pitfalls)
-      - name: Write service account key from base64
+      # Write service account key from GitHub secret
+      - name: Write service account key (raw JSON)
+        env:
+          SA_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
           set -euo pipefail
-          printf '%s' "${{ secrets.GOOGLE_SERVICE_ACCOUNT_B64 }}" | base64 -d > "$GOOGLE_APPLICATION_CREDENTIALS"
-          python -c "import json,os,sys; p=os.environ['GOOGLE_APPLICATION_CREDENTIALS']; json.load(open(p)); print('[INFO] service_account.json looks valid.')"
-
+          # Write the JSON exactly as provided
+          printf '%s' "$SA_JSON" > "$GOOGLE_APPLICATION_CREDENTIALS"
+          # Validate JSON so the job fails early if malformed/empty
+          python -c "import json,os; p=os.environ['GOOGLE_APPLICATION_CREDENTIALS']; json.load(open(p)); print('[INFO] service_account.json looks valid. Size:', len(open(p,'rb').read()), 'bytes')"
+          
       - name: Run scraper (unbuffered to flush logs)
         run: |
           python -u giant_specials_to_sheets.py
