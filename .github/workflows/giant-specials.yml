@@ -1,0 +1,64 @@
+name: Giant Specials to Google Sheets
+
+on:
+  # Run on a schedule (cron is in UTC). Example: 9:30 AM America/New_York = 13:30 UTC during EDT.
+  schedule:
+    - cron: "30 09 * * 2,5"   # Tue & Fri 05:30 ET approx. (adjust for DST/UTC as needed)
+  workflow_dispatch: {}        # allow manual runs from the GitHub UI
+
+jobs:
+  run-scraper:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    env:
+      # The script reads this path to find the JSON we write below.
+      GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/service_account.json
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install Python deps
+        run: |
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
+
+      # Install Playwright browsers & OS deps the easy way
+      - name: Install Playwright browsers
+        run: |
+            python -m playwright install --with-deps chromium
+
+      # Materialize the Google service account JSON from a GitHub Secret
+      - name: Write service account key
+        run: |
+          echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}' > "${GOOGLE_APPLICATION_CREDENTIALS}"
+
+      - name: Run scraper
+        run: |
+          python giant_specials_to_sheets.py
+
+      # Optional: upload CSV/XLSX the script generated as run artifacts
+      - name: Upload data artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: giant-specials-output
+          path: |
+            *.csv
+            *.xlsx
+          if-no-files-found: ignore
