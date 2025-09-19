@@ -1,4 +1,4 @@
-name: Giant Specials to Google Sheets
+name: Giant Weekly Ad → Google Sheets
 
 on:
   schedule:
@@ -8,6 +8,8 @@ on:
 
 jobs:
   run-scraper:
+    # If the circular site ever CAPTCHA's GitHub IPs, switch to:
+    # runs-on: [self-hosted, giantfood]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -43,30 +45,29 @@ jobs:
         run: |
           python -m playwright install --with-deps chromium
 
-      # Write service account key from GitHub secret
+      # --- Write the Google service account key (RAW JSON secret) ---
       - name: Write service account key (raw JSON)
         env:
           SA_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
           set -euo pipefail
-          # Write the JSON exactly as provided
           printf '%s' "$SA_JSON" > "$GOOGLE_APPLICATION_CREDENTIALS"
-          # Validate JSON so the job fails early if malformed/empty
           python -c "import json,os; p=os.environ['GOOGLE_APPLICATION_CREDENTIALS']; json.load(open(p)); print('[INFO] service_account.json looks valid. Size:', len(open(p,'rb').read()), 'bytes')"
-          
-      - name: Run scraper (unbuffered to flush logs)
+
+      - name: Run scraper (unbuffered logs)
         run: |
           python -u giant_specials_to_sheets.py
 
-      # Collect artifacts (CSV/XLSX when it works; screenshot/HTML if not)
+      # Collect artifacts (JSON, CSV/XLSX, and any debug screenshots/HTML)
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scraper-run
+          name: weekly-ad-run
           path: |
-            *.csv
-            *.xlsx
+            weekly_ad.json
+            weekly_ad_parsed_*.csv
+            weekly_ad_parsed_*.xlsx
             page.png
             page.html
           if-no-files-found: ignore
