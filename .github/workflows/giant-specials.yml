@@ -43,25 +43,18 @@ jobs:
         run: |
           python -m playwright install --with-deps chromium
 
-      # >>> THIS IS THE IMPORTANT PART: materialize the JSON key safely
+      # Materialize the Google service account key from base64 (no heredoc = no YAML pitfalls)
       - name: Write service account key from base64
         run: |
-          echo "${{ secrets.GOOGLE_SERVICE_ACCOUNT_B64 }}" | base64 -d > "$GOOGLE_APPLICATION_CREDENTIALS"
-          python - <<'PY'
-import json,os,sys
-p=os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
-try:
-    with open(p) as f: json.load(f)
-    print("[INFO] service_account.json looks valid.")
-except Exception as e:
-    print("[ERROR] service_account.json invalid:", e); sys.exit(1)
-PY
+          set -euo pipefail
+          printf '%s' "${{ secrets.GOOGLE_SERVICE_ACCOUNT_B64 }}" | base64 -d > "$GOOGLE_APPLICATION_CREDENTIALS"
+          python -c "import json,os,sys; p=os.environ['GOOGLE_APPLICATION_CREDENTIALS']; json.load(open(p)); print('[INFO] service_account.json looks valid.')"
 
       - name: Run scraper (unbuffered to flush logs)
         run: |
           python -u giant_specials_to_sheets.py
 
-      # Always collect artifacts for debugging (CSV/XLSX when it works, screenshots/HTML if not)
+      # Collect artifacts (CSV/XLSX when it works; screenshot/HTML if not)
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
