@@ -238,6 +238,12 @@ async def discover_weekly_json(page) -> Tuple[Optional[dict], Optional[str]]:
     """
     captured: List[Tuple[str, int, str, bytes]] = []  # (url, size, ctype, body)
 
+    def looks_interesting(url: str, content_type: str) -> bool:
+        if "application/json" in (content_type or "").lower():
+            return True
+        u = url.lower()
+        return any(h in u for h in INTERESTING_URL_HINTS)
+
     def score_candidate(url: str, size: int, ctype: str, obj: Any) -> int:
         # Higher is better: prefer JSON with item arrays
         base = 0
@@ -250,7 +256,6 @@ async def discover_weekly_json(page) -> Tuple[Optional[dict], Optional[str]]:
             base += 10
         return base
 
-    @page.on("response")
     async def handle_response(resp):
         try:
             url = resp.url
@@ -258,7 +263,6 @@ async def discover_weekly_json(page) -> Tuple[Optional[dict], Optional[str]]:
             if not looks_interesting(url, ctype):
                 return
             body = await resp.body()
-            # Try decode JSON
             try:
                 text = body.decode("utf-8", errors="ignore")
                 obj = json.loads(text)
@@ -268,10 +272,17 @@ async def discover_weekly_json(page) -> Tuple[Optional[dict], Optional[str]]:
         except Exception:
             pass
 
-    # Navigate + allow XHRs to complete
-    await page.route("**/*", lambda route: route.continue_())
+    # Register the async callback correctly
+    page.on("response", lambda r: asyncio.create_task(handle_response(r)))
+
+    # Use an async route handler (don’t return a bare coroutine from a lambda)
+    async def _passthrough(route):
+        await route.continue_()
+    await page.route("**/*", _passthrough)
+
+    # Navigate and allow XHRs to complete
     await page.goto(CIRCULAR_URL, wait_until="domcontentloaded")
-    await page.wait_for_timeout(8000)  # give late requests time
+    await page.wait_for_timeout(8000)
 
     # Rank candidates
     best: Tuple[int, Optional[dict], Optional[str]] = (0, None, None)
@@ -287,7 +298,6 @@ async def discover_weekly_json(page) -> Tuple[Optional[dict], Optional[str]]:
 
     obj, url = best[1], best[2]
     if obj:
-        # Save artifact
         try:
             with open(ARTIFACT_JSON, "w", encoding="utf-8") as f:
                 json.dump(obj, f, ensure_ascii=False)
@@ -433,3 +443,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
