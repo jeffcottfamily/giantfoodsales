@@ -1,11 +1,14 @@
 # giant_specials_to_sheets.py
 # Weekly Ad → Google Sheets (store 2333, Fort Ave Baltimore)
-# Strategy:
-#   1) Open the Giant circular page for the store on circular.giantfood.com
-#   2) Passively capture JSON responses the page requests (no DOM scraping)
-#   3) Pick the response that actually contains item data and parse it
-#   4) Write Description, Category, Original Price, Sale Price, % Discount to Google Sheets
-#   5) On failure, save weekly_ad.json + page.png/page.html and exit non-zero (for GitHub Actions)
+# Steps:
+#   1) Load circular page (circular.giantfood.com), capture JSON responses
+#   2) Pick the best payload and parse items
+#   3) Enrich Category via generic {id,name} lookup; infer Original Price and % off
+#   4) Write to Google Sheets
+#
+# Notes:
+# - Robust to schema drift (hunts for item arrays; scans IDs and deals text)
+# - Saves weekly_ad.json and optional page artifacts for troubleshooting
 
 import asyncio
 import json
@@ -29,19 +32,16 @@ CIRCULAR_URL = (
     f"?locale=en-US&store_code={STORE_CODE}&type=1"
 )
 
-# Use the full Google Sheet URL (recommended)
 GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1LbfYLSx2Pj_V5B_1qg4gSdcRB_k1slVrMN2LMdwTpaw/edit"
 WORKSHEET_NAME = f"Weekly Ad - Store {STORE_CODE}"
-
-# Path to service account JSON (provided by env in GitHub Actions)
 SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "service_account.json")
 
 # Diagnostics/artifacts
 DEBUG = True
+INCLUDE_DEAL_TEXT = True  # set False to omit Deal Text column in the sheet
 ARTIFACT_JSON = "weekly_ad.json"
 ARTIFACT_PAGE_PNG = "page.png"
 ARTIFACT_PAGE_HTML = "page.html"
-
 
 # -----------------------
 # Utilities
@@ -52,7 +52,6 @@ def clean_text(s: Optional[str]) -> Optional[str]:
         return None
     s = re.sub(r"\s+", " ", str(s)).strip()
     return s or None
-
 
 def to_float(v: Any) -> Optional[float]:
     """
@@ -67,14 +66,12 @@ def to_float(v: Any) -> Optional[float]:
     if isinstance(v, (int, float)):
         return float(v)
 
-    s = str(v)
-    s = s.replace(",", "").strip()
+    s = str(v).replace(",", "").strip()
 
     # Multi-buy like "2/$5"
     m = re.search(r"(\d+)\s*/\s*\$?(\d+(?:\.\d+)?)", s)
     if m:
-        qty = float(m.group(1))
-        total = float(m.group(2))
+        qty = float(m.group(1)); total = float(m.group(2))
         if qty > 0:
             return round(total / qty, 2)
 
@@ -87,12 +84,10 @@ def to_float(v: Any) -> Optional[float]:
             return None
     return None
 
-
 def pct_off(orig: Optional[float], sale: Optional[float]) -> Optional[float]:
     if orig and sale and orig > 0 and sale <= orig:
         return round(100 * (orig - sale) / orig, 1)
     return None
-
 
 # -----------------------
 # Playwright helpers
@@ -101,7 +96,6 @@ def pct_off(orig: Optional[float], sale: Optional[float]) -> Optional[float]:
 async def open_circular_page(context):
     page = await context.new_page()
     await page.goto(CIRCULAR_URL)
-
     # Cookie banner (OneTrust variants)
     try:
         await page.locator(
@@ -109,16 +103,14 @@ async def open_circular_page(context):
         ).first.click(timeout=3000)
     except Exception:
         pass
-
     await page.wait_for_load_state("domcontentloaded")
     return page
-
 
 async def is_botwall(page) -> bool:
     """Detect obvious CAPTCHA/bot-wall pages early."""
     try:
-        html = await page.content()
-        if "captcha-delivery.com" in html.lower():
+        html = (await page.content()).lower()
+        if "captcha-delivery.com" in html:
             return True
         if await page.locator("text=Verification Required").count() > 0:
             return True
@@ -128,14 +120,11 @@ async def is_botwall(page) -> bool:
         pass
     return False
 
-
 # -----------------------
-# JSON discovery and parsing
+# JSON discovery and ranking
 # -----------------------
 
-INTERESTING_URL_HINTS = (
-    "flyer", "item", "items", "product", "offers", "deals", "json", "api", "graphql"
-)
+INTERESTING_URL_HINTS = ("flyer", "item", "items", "product", "offers", "deals", "json", "api", "graphql")
 
 def looks_interesting(url: str, content_type: str) -> bool:
     if "application/json" in (content_type or "").lower():
@@ -143,31 +132,27 @@ def looks_interesting(url: str, content_type: str) -> bool:
     u = url.lower()
     return any(h in u for h in INTERESTING_URL_HINTS)
 
-
 def tree_find_item_arrays(obj: Any, depth: int = 0) -> List[List[Dict[str, Any]]]:
     """
     Recursively search for arrays of dicts that look like item objects.
-    Heuristics: list of dicts with at least one of these keys per element:
-      name/title/description AND some price-ish key.
+    Heuristic: list of dicts with 'name/title/description' and some price-ish key.
     """
     results: List[List[Dict[str, Any]]] = []
-    if depth > 6:
+    if depth > 7:
         return results
 
     if isinstance(obj, list) and obj and all(isinstance(x, dict) for x in obj):
-        # Check if this list looks like item objects
-        price_keys = {"price", "prices", "sale_price", "current_price", "regular_price", "compare_at_price"}
+        price_keys = {"price", "prices", "sale_price", "current_price", "regular_price", "compare_at_price", "pricing"}
         name_keys = {"name", "title", "description", "desc"}
+        sample = obj[:10]
         matches = 0
-        sample = obj[:8]
         for it in sample:
             keys = set(k.lower() for k in it.keys())
-            if keys & name_keys:
-                # price present either as direct keys or nested 'price' object
-                if (keys & price_keys) or ("price" in keys) or ("pricing" in keys):
-                    matches += 1
-        if matches >= max(2, len(sample) // 2):
-            results.append(obj)  # looks like items
+            if keys & name_keys and (keys & price_keys or "price" in keys or "pricing" in keys):
+                matches += 1
+        if matches >= max(2, len(sample)//2):
+            results.append(obj)
+            # Don't recurse deeper from here (already an item list)
             return results
 
     if isinstance(obj, dict):
@@ -178,70 +163,6 @@ def tree_find_item_arrays(obj: Any, depth: int = 0) -> List[List[Dict[str, Any]]
             results.extend(tree_find_item_arrays(v, depth + 1))
     return results
 
-
-def parse_item_row(it: Dict[str, Any], cat_lookup: dict) -> Dict[str, Any]:
-    # Description
-    desc = clean_text(it.get("name") or it.get("title") or it.get("description") or it.get("desc"))
-
-    # Category via direct string or via referenced IDs
-    cat = (
-        clean_text(it.get("category") or it.get("department") or it.get("dept")) or
-        None
-    )
-    if not cat:
-        ids = []
-        for k in ("category_ids", "categories", "department_ids", "section_ids"):
-            v = it.get(k)
-            if isinstance(v, list):
-                ids.extend(v)
-            elif v is not None:
-                ids.append(v)
-        # First match wins
-        for _id in ids:
-            name = cat_lookup.get(str(_id))
-            if name:
-                cat = name
-                break
-
-    # Prices
-    sale = to_float(it.get("sale_price") or it.get("current_price") or it.get("promo_price"))
-    orig = to_float(it.get("regular_price") or it.get("compare_at_price") or it.get("original_price"))
-
-    price = it.get("price") or it.get("prices") or it.get("pricing") or {}
-    if isinstance(price, dict):
-        sale = sale or to_float(price.get("sale") or price.get("current") or price.get("promo") or price.get("display"))
-        orig = orig or to_float(price.get("regular") or price.get("was") or price.get("compare_at") or price.get("strikethrough") or price.get("compare_at_display"))
-
-    # Deal/marketing text (helps infer BO(G)O etc.)
-    deal_text = clean_text(
-        it.get("offer_text") or it.get("badge_text") or it.get("tagline") or
-        it.get("promotion_text") or it.get("promo_text") or it.get("deal_text")
-    )
-
-    # Heuristics: infer unit price from common patterns if sale missing
-    if sale is None:
-        sale = to_float(deal_text)  # catches "2/$5" etc.
-    # Basic BOGO heuristics (only if we have an original price)
-    if sale is None and orig and deal_text:
-        s = deal_text.lower()
-        # BOGO (Buy 1 Get 1 Free) ≈ 50% off per unit
-        if "bogo" in s or ("buy 1" in s and "get 1" in s and "free" in s):
-            sale = round(orig / 2.0, 2)
-        # Buy 2 get 1 free → effective 2/3 of orig per unit
-        elif ("buy 2" in s and "get 1" in s and "free" in s):
-            sale = round(orig * (2.0/3.0), 2)
-
-    return {
-        "Description": desc,
-        "Category": cat,
-        "Original Price": orig,
-        "Sale Price": sale,
-        "% Discount": pct_off(orig, sale),
-        # Optional: keep the raw marketing text for transparency
-        "Deal Text": deal_text,
-    }
-
-
 async def discover_weekly_json(page) -> Tuple[Optional[dict], Optional[str]]:
     """
     Listen for JSON responses while the circular page loads.
@@ -249,18 +170,11 @@ async def discover_weekly_json(page) -> Tuple[Optional[dict], Optional[str]]:
     """
     captured: List[Tuple[str, int, str, bytes]] = []  # (url, size, ctype, body)
 
-    def looks_interesting(url: str, content_type: str) -> bool:
-        if "application/json" in (content_type or "").lower():
-            return True
-        u = url.lower()
-        return any(h in u for h in INTERESTING_URL_HINTS)
-
     def score_candidate(url: str, size: int, ctype: str, obj: Any) -> int:
-        # Higher is better: prefer JSON with item arrays
         base = 0
         if looks_interesting(url, ctype):
             base += 5
-        base += min(size // 2048, 20)  # size heuristic (2KB units capped)
+        base += min(size // 2048, 20)  # size heuristic (~2KB units capped)
         item_sets = tree_find_item_arrays(obj)
         base += 10 * len(item_sets)
         if item_sets and len(item_sets[0]) >= 10:
@@ -283,19 +197,15 @@ async def discover_weekly_json(page) -> Tuple[Optional[dict], Optional[str]]:
         except Exception:
             pass
 
-    # Register the async callback correctly
     page.on("response", lambda r: asyncio.create_task(handle_response(r)))
 
-    # Use an async route handler (don’t return a bare coroutine from a lambda)
     async def _passthrough(route):
         await route.continue_()
     await page.route("**/*", _passthrough)
 
-    # Navigate and allow XHRs to complete
     await page.goto(CIRCULAR_URL, wait_until="domcontentloaded")
     await page.wait_for_timeout(8000)
 
-    # Rank candidates
     best: Tuple[int, Optional[dict], Optional[str]] = (0, None, None)
     for url, size, ctype, body in captured:
         try:
@@ -316,10 +226,169 @@ async def discover_weekly_json(page) -> Tuple[Optional[dict], Optional[str]]:
             pass
     return obj, url
 
+# -----------------------
+# Enrichment: category lookup & price inference
+# -----------------------
+
+ID_FIELD_RX = re.compile(r"(category|department|section|taxonomy|group|node).*(_ids?|Id|ID|IDs?)$", re.I)
+
+def build_id_name_lookup(payload: Any) -> Dict[str, str]:
+    """
+    Build a generic {id -> name} mapping by scanning the payload for dicts
+    that contain id/name or code/name pairs. Works even if categories live
+    under data/meta/taxonomy/sections/etc.
+    """
+    lookup: Dict[str, str] = {}
+
+    def visit(x: Any, depth: int = 0):
+        if depth > 8:
+            return
+        if isinstance(x, dict):
+            keys = {k.lower() for k in x.keys()}
+            # common id/name shapes
+            if (("id" in x and ("name" in x or "title" in x))
+                or ("code" in x and ("name" in x or "title" in x))):
+                try:
+                    _id = str(x.get("id", x.get("code")))
+                    _nm = str(x.get("name", x.get("title"))).strip()
+                    if _id and _nm:
+                        lookup[_id] = _nm
+                except Exception:
+                    pass
+            for v in x.values():
+                visit(v, depth + 1)
+        elif isinstance(x, list):
+            for v in x:
+                visit(v, depth + 1)
+
+    visit(payload)
+    return lookup
+
+def extract_related_ids(it: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """
+    From an item dict, extract (fieldName, id) pairs for any key that looks
+    like a category/department/section/taxonomy id or ids.
+    """
+    pairs: List[Tuple[str, str]] = []
+    for k, v in it.items():
+        if not isinstance(k, str):
+            continue
+        if ID_FIELD_RX.search(k):
+            if isinstance(v, list):
+                for _id in v:
+                    if _id is not None:
+                        pairs.append((k, str(_id)))
+            else:
+                if v is not None:
+                    pairs.append((k, str(v)))
+    return pairs
+
+def infer_prices_from_deal_text(orig: Optional[float], sale: Optional[float], deal_text: Optional[str]) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Try to fill missing original/sale from marketing text such as:
+      - "Save $2"          => orig = sale + 2
+      - "Save up to $4.00" => same
+      - "25% off"          => orig = sale / 0.75
+      - "BOGO"             => sale ≈ orig/2
+      - "Buy 2 Get 1 Free" => sale ≈ orig*(2/3)
+      - "2/$5"             => sale = 2.50
+    """
+    if not deal_text:
+        return orig, sale
+    s = deal_text.lower()
+
+    # 2/$5 etc.
+    per = to_float(deal_text)
+    if sale is None and per is not None:
+        sale = per
+
+    # Save $X
+    m = re.search(r"save\s*\$?\s*(\d+(?:\.\d+)?)", s, re.I)
+    if m and sale is not None and (orig is None or orig < sale):
+        try:
+            sv = float(m.group(1))
+            if sv > 0:
+                orig = round(sale + sv, 2)
+        except Exception:
+            pass
+
+    # X% off
+    m = re.search(r"(\d{1,2}|100)\s*%?\s*off", s)
+    if m and sale is not None and (orig is None or orig < sale):
+        try:
+            pct = float(m.group(1))
+            if 0 < pct < 100:
+                orig = round(sale / (1 - pct/100.0), 2)
+        except Exception:
+            pass
+
+    # BOGO / buy one get one free
+    if orig and sale is None and ("bogo" in s or ("buy 1" in s and "get 1" in s and "free" in s)):
+        sale = round(orig / 2.0, 2)
+    # Buy 2 get 1 free
+    if orig and sale is None and ("buy 2" in s and "get 1" in s and "free" in s):
+        sale = round(orig * (2.0/3.0), 2)
+
+    return orig, sale
+
+def parse_item_row(it: Dict[str, Any], cat_lookup: dict) -> Dict[str, Any]:
+    # Description
+    desc = clean_text(it.get("name") or it.get("title") or it.get("description") or it.get("desc"))
+
+    # Category via direct string or via referenced IDs
+    cat = clean_text(it.get("category") or it.get("department") or it.get("dept"))
+    if not cat:
+        rels = extract_related_ids(it)
+        # Prefer fields whose name contains 'category' over others
+        preferred = [name for key, _ in rels for name in [cat_lookup.get(_)] if name and "category" in key.lower()]
+        fallback  = [name for _, _id in rels if (name := cat_lookup.get(_id))]
+        cat = preferred[0] if preferred else (fallback[0] if fallback else None)
+
+    # Prices (direct and nested)
+    sale = to_float(it.get("sale_price") or it.get("current_price") or it.get("promo_price"))
+    orig = to_float(it.get("regular_price") or it.get("compare_at_price") or it.get("original_price"))
+
+    price = it.get("price") or it.get("prices") or it.get("pricing") or {}
+    if isinstance(price, dict):
+        sale = sale or to_float(price.get("sale") or price.get("current") or price.get("promo") or price.get("display"))
+        orig = orig or to_float(price.get("regular") or price.get("was") or price.get("compare_at") or price.get("strikethrough") or price.get("compare_at_display"))
+
+    # Savings fields sometimes exist
+    savings_amt = to_float(it.get("savings") or it.get("savings_amount") or (price.get("savings") if isinstance(price, dict) else None))
+    savings_pct = to_float(it.get("savings_percent") or (price.get("savings_percent") if isinstance(price, dict) else None))
+
+    # Deal/marketing text
+    deal_text = clean_text(
+        it.get("offer_text") or it.get("badge_text") or it.get("tagline") or
+        it.get("promotion_text") or it.get("promo_text") or it.get("deal_text") or
+        (price.get("label") if isinstance(price, dict) else None)
+    )
+
+    # Infer missing prices from savings / deal text
+    if orig is None and sale is not None and savings_amt:
+        orig = round(sale + savings_amt, 2)
+    if orig is None and sale is not None and savings_pct and 0 < savings_pct < 100:
+        try:
+            orig = round(sale / (1 - (savings_pct/100.0)), 2)
+        except Exception:
+            pass
+
+    orig, sale = infer_prices_from_deal_text(orig, sale, deal_text)
+
+    row = {
+        "Description": desc,
+        "Category": cat,
+        "Original Price": orig,
+        "Sale Price": sale,
+        "% Discount": pct_off(orig, sale),
+    }
+    if INCLUDE_DEAL_TEXT:
+        row["Deal Text"] = deal_text
+    return row
 
 def parse_rows_from_payload(payload: dict) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    cat_lookup = build_category_lookup(payload)
+    cat_lookup = build_id_name_lookup(payload)
 
     item_sets = tree_find_item_arrays(payload)
     items: List[Dict[str, Any]] = max(item_sets, key=lambda arr: len(arr)) if item_sets else []
@@ -328,61 +397,9 @@ def parse_rows_from_payload(payload: dict) -> List[Dict[str, Any]]:
         if not isinstance(it, dict):
             continue
         row = parse_item_row(it, cat_lookup)
-        # Keep rows that at least have a description and some price info
         if row.get("Description") and (row.get("Sale Price") is not None or row.get("Original Price") is not None):
             rows.append(row)
     return rows
-
-
-def build_category_lookup(payload: dict) -> dict:
-    """
-    Returns a mapping of {id -> category/department name} by scanning common
-    places the circular schema uses to define categories/sections/departments.
-    """
-    lookup = {}
-
-    def add_from(obj, id_key="id", name_key="name"):
-        if isinstance(obj, dict):
-            # dict-of-dicts or dict-of-lists
-            for v in obj.values():
-                add_from(v, id_key, name_key)
-        elif isinstance(obj, list):
-            for x in obj:
-                add_from(x, id_key, name_key)
-        elif isinstance(obj, (str, int, float)):
-            return
-
-        if isinstance(obj, dict) and id_key in obj and name_key in obj:
-            try:
-                lookup[str(obj[id_key])] = str(obj[name_key]).strip()
-            except Exception:
-                pass
-
-    # Common containers seen in circular payloads
-    for key in ["categories", "departments", "sections", "taxonomy", "nodes"]:
-        if key in payload:
-            add_from(payload[key])
-    # Some schemas tuck them under data/meta
-    for key in ["data", "meta"]:
-        if key in payload:
-            for sub in ["categories", "departments", "sections", "taxonomy", "nodes"]:
-                if isinstance(payload[key], dict) and sub in payload[key]:
-                    add_from(payload[key][sub])
-
-    return lookup
-
-def flyer_dates(payload: dict) -> tuple[Optional[str], Optional[str]]:
-    # Try common places for start/end
-    for k in ["flyer", "data", "meta"]:
-        obj = payload.get(k, {})
-        if not isinstance(obj, dict): 
-            continue
-        start = clean_text(obj.get("start_date") or obj.get("start") or obj.get("effective_date"))
-        end   = clean_text(obj.get("end_date")   or obj.get("end")   or obj.get("expiration_date"))
-        if start or end:
-            return start, end
-    return None, None
-
 
 # -----------------------
 # Google Sheets
@@ -392,7 +409,6 @@ def write_to_google_sheet(df: pd.DataFrame):
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_JSON, scopes=scopes)
 
-    # Helpful log (which SA is writing)
     try:
         with open(SERVICE_ACCOUNT_JSON, "r") as f:
             svc = json.load(f)
@@ -404,11 +420,12 @@ def write_to_google_sheet(df: pd.DataFrame):
     sh = gc.open_by_url(GOOGLE_SHEET_URL)
     print("[INFO] Opened sheet by URL:", GOOGLE_SHEET_URL)
 
-    # Replace target worksheet
     try:
         ws = sh.worksheet(WORKSHEET_NAME)
         sh.del_worksheet(ws)
         print("[INFO] Deleted old worksheet:", WORKSHEET_NAME)
+    except gspread.SpreadsheetNotFound:
+        raise
     except gspread.WorksheetNotFound:
         print("[INFO] Worksheet not found; creating:", WORKSHEET_NAME)
 
@@ -416,7 +433,6 @@ def write_to_google_sheet(df: pd.DataFrame):
     ws.update([df.columns.tolist()] + df.astype(object).where(pd.notna(df), "").values.tolist())
     ws.freeze(rows=1)
     print(f"[INFO] Wrote {len(df)} rows to worksheet '{WORKSHEET_NAME}'")
-
 
 # -----------------------
 # Main
@@ -438,7 +454,6 @@ async def run() -> int:
         page = await open_circular_page(context)
 
         if await is_botwall(page):
-            # Save artifacts for inspection
             try:
                 await page.screenshot(path=ARTIFACT_PAGE_PNG, full_page=True)
                 with open(ARTIFACT_PAGE_HTML, "w", encoding="utf-8") as f:
@@ -453,7 +468,6 @@ async def run() -> int:
         if payload:
             print("[INFO] Weekly JSON discovered from:", src_url)
         else:
-            # Capture page artifacts for debugging
             if DEBUG:
                 try:
                     await page.screenshot(path=ARTIFACT_PAGE_PNG, full_page=True)
@@ -465,22 +479,18 @@ async def run() -> int:
             await browser.close()
             return 3
 
-        start, end = flyer_dates(payload)
-        if start or end:
-            print(f"[INFO] Flyer dates: {start} → {end}")
-
         await browser.close()
-        
-    
+
     # Parse → DataFrame
     rows = parse_rows_from_payload(payload)
     df = pd.DataFrame(rows).drop_duplicates().copy()
 
-    if not df.empty and "% Discount" in df.columns:
+    # Sort for readability
+    if "% Discount" in df.columns:
         df["% Discount"] = pd.to_numeric(df["% Discount"], errors="coerce")
         df = df.sort_values(by=["% Discount", "Description"], ascending=[False, True])
 
-    # Local artifacts (handy to inspect in Actions)
+    # Local artifacts for inspection
     stamp = datetime.now().strftime("%Y%m%d")
     if not df.empty:
         df.to_csv(f"weekly_ad_parsed_{STORE_CODE}_{stamp}.csv", index=False)
@@ -492,18 +502,13 @@ async def run() -> int:
         print("[ERROR] Zero rows parsed from the weekly ad JSON. See", ARTIFACT_JSON, "and page artifacts.")
         return 4
 
-    # Push to Google Sheets
     write_to_google_sheet(df)
     return 0
-
 
 def main():
     code = asyncio.run(run())
     if code != 0:
         raise SystemExit(code)
 
-
 if __name__ == "__main__":
     main()
-
-
